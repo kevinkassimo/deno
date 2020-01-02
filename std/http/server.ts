@@ -504,3 +504,93 @@ export interface Response {
   headers?: Headers;
   body?: Uint8Array | Reader;
 }
+
+export class ConnServer implements AsyncIterable<ServerRequest> {
+  private connQueue: Conn[] = [];
+  private connDeferred: Deferred<void> = deferred();
+  constructor() {}
+
+  addConn(conn: Conn): void {
+    this.connQueue.push(conn);
+    this.connDeferred.resolve();
+  }
+
+  // Yields all HTTP requests on a single TCP connection.
+  private async *iterateHttpRequests(
+    conn: Conn
+  ): AsyncIterableIterator<ServerRequest> {
+    const bufr = new BufReader(conn);
+    const w = new BufWriter(conn);
+    let req: ServerRequest | Deno.EOF;
+    let err: Error | undefined;
+
+    while (true) {
+      try {
+        req = await readRequest(conn, bufr);
+      } catch (e) {
+        err = e;
+        break;
+      }
+      if (req === Deno.EOF) {
+        break;
+      }
+
+      req.w = w;
+      yield req;
+
+      // Wait for the request to be processed before we accept a new request on
+      // this connection.
+      const procError = await req!.done;
+      if (procError) {
+        // Something bad happened during response.
+        // (likely other side closed during pipelined req)
+        // req.done implies this connection already closed, so we can just return.
+        return;
+      }
+    }
+
+    if (req! === Deno.EOF) {
+      // The connection was gracefully closed.
+    } else if (err) {
+      // An error was thrown while parsing request headers.
+      try {
+        await writeResponse(req!.w, {
+          status: 400,
+          body: new TextEncoder().encode(`${err.message}\r\n\r\n`)
+        });
+      } catch (_) {
+        // The connection is destroyed.
+        // Ignores the error.
+      }
+    }
+
+    conn.close();
+  }
+
+  // Accepts a new TCP connection and yields all HTTP requests that arrive on
+  // it. When a connection is accepted, it also creates a new iterator of the
+  // same kind and adds it to the request multiplexer so that another TCP
+  // connection can be accepted.
+  private async *acceptConnAndIterateHttpRequests(
+    mux: MuxAsyncIterator<ServerRequest>
+  ): AsyncIterableIterator<ServerRequest> {
+    // Wait for a new connection.
+    await this.connDeferred;
+    const conn = this.connQueue.shift()!;
+    // There might be more connections available. If yes, self resolve
+    this.connDeferred = deferred();
+    if (this.connQueue.length > 0) {
+      this.connDeferred.resolve();
+    }
+    // Try to accept another connection and add it to the multiplexer.
+    mux.add(this.acceptConnAndIterateHttpRequests(mux));
+    // Yield the requests that arrive on the just-accepted connection.
+    yield* this.iterateHttpRequests(conn);
+  }
+
+  [Symbol.asyncIterator](): AsyncIterableIterator<ServerRequest> {
+    const mux: MuxAsyncIterator<ServerRequest> = new MuxAsyncIterator();
+    mux.add(this.acceptConnAndIterateHttpRequests(mux));
+    return mux.iterate();
+  }
+}
